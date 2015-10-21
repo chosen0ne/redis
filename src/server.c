@@ -1828,7 +1828,7 @@ void initServer(void) {
     server.system_memory_size = zmalloc_get_memory_size();
 
     // <MM>
-    // 常见常量池，用于在各种请求间共享对象，避免频繁创建对象、分配、释放内存
+    // 创建常量池，用于在各种请求间共享对象，避免频繁创建对象、分配、释放内存
     // </MM>
     createSharedObjects();
     // <MM>
@@ -3902,15 +3902,18 @@ int main(int argc, char **argv) {
 
     /* We need to initialize our libraries, and the server configuration. */
 #ifdef INIT_SETPROCTITLE_REPLACEMENT
+    // <MM>
+    // 初始化进程title的配置
+    // </MM>
     spt_init(argc, argv);
 #endif
     // <MM>
-    // 设置字符排序规则，传入""以环境变量设置locale
-    // 主要影响正则表达式，字符串的排序
+    // 设置字符排序规则，传入""就是以环境变量设置locale
+    // 主要影响正则表达式，字符的排序
     // </MM>
     setlocale(LC_COLLATE,"");
     // <MM>
-    // 开启zmalloc的线程安全
+    // 使zmalloc线程安全
     // </MM>
     zmalloc_enable_thread_safeness();
     // <MM>
@@ -3983,6 +3986,7 @@ int main(int argc, char **argv) {
         // <MM>
         // 将命令行参数以"option_name option_value\n"格式追加到字符串options
         // 最后会添加到配置文件内容的最后，以覆盖配置文件中的内容
+        // 以此方式，通过配置解析函数同时解析命令行参数和配置文件
         // </MM>
         /* All the other options are parsed and conceptually appended to the
          * configuration file. For instance --port 6380 will generate the
@@ -4032,7 +4036,7 @@ int main(int argc, char **argv) {
     }
 
     // <MM>
-    // To confirmed
+    // ToDO
     // </MM>
     server.supervised = redisIsSupervised(server.supervised_mode);
     int background = server.daemonize && !server.supervised;
@@ -4042,7 +4046,7 @@ int main(int argc, char **argv) {
     if (background) daemonize();
 
     // <MM>
-    // 根据配置文件进行初始化
+    // 根据配置进行初始化
     // </MM>
     initServer();
     // <MM>

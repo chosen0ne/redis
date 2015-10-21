@@ -60,9 +60,15 @@ typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 
 /* File event structure */
 typedef struct aeFileEvent {
+    // <MM>
+    // 要监听的事件类型，读事件或写事件
+    // </MM>
     int mask; /* one of AE_(READABLE|WRITABLE) */
     aeFileProc *rfileProc;
     aeFileProc *wfileProc;
+    // <MM>
+    // 定制化的数据，传入的是client结构，存放此链接相关的数据结构
+    // </MM>
     void *clientData;
 } aeFileEvent;
 
@@ -74,6 +80,9 @@ typedef struct aeTimeEvent {
     aeTimeProc *timeProc;
     aeEventFinalizerProc *finalizerProc;
     void *clientData;
+    // <MM>
+    // 时间事件组织成链表，指向下一个事件
+    // </MM>
     struct aeTimeEvent *next;
 } aeTimeEvent;
 
@@ -85,15 +94,48 @@ typedef struct aeFiredEvent {
 
 /* State of an event based program */
 typedef struct aeEventLoop {
+    // <MM>
+    // 目前注册事件的fd的最大值
+    // </MM>
     int maxfd;   /* highest file descriptor currently registered */
+    // <MM>
+    // 指定可监听事件的最大数量
+    // 将监听的事件由events数组维护，setsize指定数组大小
+    // </MM>
     int setsize; /* max number of file descriptors tracked */
+    // <MM>
+    // 用于生产时间事件的计数器
+    // </MM>
     long long timeEventNextId;
+    // <MM>
+    // 上次事件触发的时间，用于处理system clock skew
+    // </MM>
     time_t lastTime;     /* Used to detect system clock skew */
+    // <MM>
+    // 注册的事件集合，数组类型，大小由setsize指定
+    // </MM>
     aeFileEvent *events; /* Registered events */
+    // <MM>
+    // 存放触发事件的集合，大小由setsize指定
+    // 为一个fd注册事件时，分配的事件在events数组中的下标由fd的值决定。
+    // 在epoll或select中，触发的事件也是由fd指定，fd触发的事件在fired
+    // 数组中的下标同样有fd指定。
+    // 则通过fd关联了注册事件集合、触发事件集合以及具体api
+    // </MM>
     aeFiredEvent *fired; /* Fired events */
+    // <MM>
+    // 注册的时间事件。redis将时间事件组织成链表
+    // </MM>
     aeTimeEvent *timeEventHead;
+    // 是否停止事件循环
     int stop;
+    // <MM>
+    // 与epoll，select等具体实现有关的数据结构
+    // </MM>
     void *apidata; /* This is used for polling API specific data */
+    // <MM>
+    // 在每次事件循环前回调
+    // </MM>
     aeBeforeSleepProc *beforesleep;
 } aeEventLoop;
 

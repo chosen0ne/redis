@@ -139,6 +139,10 @@ int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
         errno = ERANGE;
         return AE_ERR;
     }
+    // <MM>
+    // 将注册事件存放在events数组中fd对应的项
+    // 便于在事件触发时，以O(1)获取到对应的事件
+    // </MM>
     aeFileEvent *fe = &eventLoop->events[fd];
 
     if (aeApiAddEvent(eventLoop, fd, mask) == -1)
@@ -224,6 +228,9 @@ int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
     aeTimeEvent *te, *prev = NULL;
 
     te = eventLoop->timeEventHead;
+    // <MM>
+    // 遍历链表，将id对应的项删除
+    // </MM>
     while(te) {
         if (te->id == id) {
             if (prev == NULL)
@@ -297,11 +304,18 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
         long now_sec, now_ms;
         long long id;
 
+        // <MM>
+        // 跳过，处理时间事件时新注册的时间事件
+        // 避免死循环
+        // </MM>
         if (te->id > maxId) {
             te = te->next;
             continue;
         }
         aeGetTime(&now_sec, &now_ms);
+        // <MM>
+        // 根据当前时间是否大于触发时间，判断该时间事件是否要触发
+        // </MM>
         if (now_sec > te->when_sec ||
             (now_sec == te->when_sec && now_ms >= te->when_ms))
         {
@@ -356,6 +370,10 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
+    // <MM>
+    // 首先计算此次事件循环sleep的时间，根据时间事件设定
+    // 先处理文件事件，再处理时间事件
+    // </MM>
     /* Note that we want call select() even if there are no
      * file events to process as long as we want to process time
      * events, in order to sleep until the next time event is ready
@@ -367,10 +385,17 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         struct timeval tv, *tvp;
 
         if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+            // <MM>
+            // 查找最近要触发的事件
+            // </MM>
             shortest = aeSearchNearestTimer(eventLoop);
         if (shortest) {
             long now_sec, now_ms;
 
+            // <MM>
+            // 计算具体该时间时间触发所需的时间
+            //  触发时间 - 当前时间
+            // </MM>
             /* Calculate the time missing for the nearest
              * timer to fire. */
             aeGetTime(&now_sec, &now_ms);
@@ -397,6 +422,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             }
         }
 
+        // <MM>
+        // 指定时间间隔去poll，直到有io时间发生或超时
+        // aeApiPoll返回后，会将触发事件的fd在fired事件集合中对应的项置位
+        // 表示事件发生，以及事件类型
+        // </MM>
         numevents = aeApiPoll(eventLoop, tvp);
         for (j = 0; j < numevents; j++) {
             aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
@@ -404,7 +434,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             int fd = eventLoop->fired[j].fd;
             int rfired = 0;
 
-	    /* note the fe->mask & mask & ... code: maybe an already processed
+            // <MM>
+            // fe->mask & mask & ...：此轮事件循环中某个回调函数可能会删除一个
+            // 事件，通过此种方式避免这类事件被错误处理
+            // </MM>
+	        /* note the fe->mask & mask & ... code: maybe an already processed
              * event removed an element that fired and we still didn't
              * processed, so we check if the event is still valid. */
             if (fe->mask & mask & AE_READABLE) {
@@ -412,6 +446,11 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
                 fe->rfileProc(eventLoop,fd,fe->clientData,mask);
             }
             if (fe->mask & mask & AE_WRITABLE) {
+                // <MM>
+                // rfired表示已经处理过读事件
+                // 没有处理过读事件；或者处理过读事件，但读、写事件的处理函数不同
+                // TODO: 用于解决什么问题？
+                // </MM>
                 if (!rfired || fe->wfileProc != fe->rfileProc)
                     fe->wfileProc(eventLoop,fd,fe->clientData,mask);
             }
@@ -425,6 +464,9 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     return processed; /* return the number of processed file/time events */
 }
 
+// <MM>
+// 用于进行同步操作，比如在主从同步过程中的一些同步操作
+// </MM>
 /* Wait for milliseconds until the given file descriptor becomes
  * writable/readable/exception */
 int aeWait(int fd, int mask, long long milliseconds) {
