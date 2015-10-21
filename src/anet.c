@@ -481,7 +481,13 @@ static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backl
             continue;
 
         if (af == AF_INET6 && anetV6Only(err,s) == ANET_ERR) goto error;
+        // <MM>
+        // 设置SO_REUSEADDR，保证redis重启后，不因为TIME_WAIT导致重启失败
+        // </MM>
         if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
+        // <MM>
+        // 调用bind + listen
+        // </MM>
         if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) goto error;
         goto end;
     }

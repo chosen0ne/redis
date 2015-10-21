@@ -1717,12 +1717,18 @@ int listenToPort(int port, int *fds, int *count) {
      * entering the loop if j == 0. */
     if (server.bindaddr_count == 0) server.bindaddr[0] = NULL;
     for (j = 0; j < server.bindaddr_count || j == 0; j++) {
+        // <MM>
+        // 配置文件中没有指明监听地址，则意味着*:PORT
+        // </MM>
         if (server.bindaddr[j] == NULL) {
             /* Bind * for both IPv6 and IPv4, we enter here only if
              * server.bindaddr_count == 0. */
             fds[*count] = anetTcp6Server(server.neterr,port,NULL,
                 server.tcp_backlog);
             if (fds[*count] != ANET_ERR) {
+                // <MM>
+                // 调用fcntl将socket设置成非阻塞的
+                // </MM>
                 anetNonBlock(NULL,fds[*count]);
                 (*count)++;
             }
@@ -1791,10 +1797,16 @@ void resetServerStats(void) {
 void initServer(void) {
     int j;
 
+    // <MM>
+    // 设置信号处理
+    // </MM>
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
     setupSignalHandlers();
 
+    // <MM>
+    // 初始化syslog
+    // </MM>
     if (server.syslog_enabled) {
         openlog(server.syslog_ident, LOG_PID | LOG_NDELAY | LOG_NOWAIT,
             server.syslog_facility);
@@ -1815,16 +1827,31 @@ void initServer(void) {
     server.clients_paused = 0;
     server.system_memory_size = zmalloc_get_memory_size();
 
+    // <MM>
+    // 常见常量池，用于在各种请求间共享对象，避免频繁创建对象、分配、释放内存
+    // </MM>
     createSharedObjects();
+    // <MM>
+    // 根据配置尽可能调高系统打开文件描述符的限制
+    // </MM>
     adjustOpenFilesLimit();
+    // <MM>
+    // 创建event loop对象
+    // </MM>
     server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
 
+    // <MM>
+    // 如配置了端口，则初始化监听socket：socket + bind + listen
+    // </MM>
     /* Open the TCP listening socket for the user commands. */
     if (server.port != 0 &&
         listenToPort(server.port,server.ipfd,&server.ipfd_count) == C_ERR)
         exit(1);
 
+    // <MM>
+    // 如配置为domain socket方式，则初始化domain socket
+    // </MM>
     /* Open the listening Unix domain socket. */
     if (server.unixsocket != NULL) {
         unlink(server.unixsocket); /* don't care if this fails */
@@ -1854,14 +1881,24 @@ void initServer(void) {
         server.db[j].id = j;
         server.db[j].avg_ttl = 0;
     }
+    // <MM>
+    // 初始化pub-sub相关数据结构
+    // </MM>
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
     listSetFreeMethod(server.pubsub_patterns,freePubsubPattern);
     listSetMatchMethod(server.pubsub_patterns,listMatchPubsubPattern);
     server.cronloops = 0;
+    // <MM>
+    // 初始化rdb，aof相关状态
+    // </MM>
     server.rdb_child_pid = -1;
     server.aof_child_pid = -1;
     server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    // <MM>
+    // 重置aof rewrite buffer
+    // rewrite buffer用于在进行rewrite时，暂存redo log，当rewrite结束后，追加到其后
+    // </MM>
     aofRewriteBufferReset();
     server.aof_buf = sdsempty();
     server.lastsave = time(NULL); /* At startup we consider the DB saved. */
@@ -1878,8 +1915,18 @@ void initServer(void) {
     server.aof_last_write_status = C_OK;
     server.aof_last_write_errno = 0;
     server.repl_good_slaves_count = 0;
+    // <MM>
+    // 为避免调用time的开销，记录全局时间，每次事件循环更新
+    // 即同一事件循环，会共用一个时间戳，会有误差，不过事件循环默认最多是10ms
+    // 可以容许此级别的误差
+    // </MM>
     updateCachedTime();
 
+    // <MM>
+    // 注册定时器事件，redis目前只有serverCron一个定时器事件
+    // 用于异步处理一些事情：rdb，aof，replication，过期可以踢出等
+    // 每1/server.hz执行一次，默认是10ms
+    // </MM>
     /* Create out timers, that's our main way to process background
      * operations. */
     if (aeCreateTimeEvent(server.el, 1, serverCron, NULL, NULL) == AE_ERR) {
@@ -1887,6 +1934,11 @@ void initServer(void) {
         exit(1);
     }
 
+    // <MM>
+    // 为每个listen socket注册读事件，用于处理客户端连接
+    //      客户端请求的入口就是从acceptTcpHandler开始，连接成功后，会为该客户端
+    //      注册读事件处理函数readQueryFromClient，用于处理客户端的请求
+    // </MM>
     /* Create an event handler for accepting new connections in TCP and Unix
      * domain sockets. */
     for (j = 0; j < server.ipfd_count; j++) {
@@ -1900,6 +1952,9 @@ void initServer(void) {
     if (server.sofd > 0 && aeCreateFileEvent(server.el,server.sofd,AE_READABLE,
         acceptUnixHandler,NULL) == AE_ERR) serverPanic("Unrecoverable error creating server.sofd file event.");
 
+    // <MM>
+    // 配置开启aof，则创建aof文件
+    // </MM>
     /* Open the AOF file if needed. */
     if (server.aof_state == AOF_ON) {
         server.aof_fd = open(server.aof_filename,
@@ -1924,8 +1979,17 @@ void initServer(void) {
     if (server.cluster_enabled) clusterInit();
     replicationScriptCacheInit();
     scriptingInit();
+    // <MM>
+    // 初始化slow log，用于记录处理时间超过指定阈值的请求
+    // </MM>
     slowlogInit();
+    // <MM>
+    // 初始化latencyMonitor，用于记录超过延迟阈值的请求
+    // </MM>
     latencyMonitorInit();
+    // <MM>
+    // 初始化bio，即后台线程，用于处理磁盘io相关任务
+    // </MM>
     bioInit();
 }
 
@@ -3490,9 +3554,19 @@ int linuxOvercommitMemoryValue(void) {
 }
 
 void linuxMemoryWarnings(void) {
+    // <MM>
+    // 建议将overcommit参数设置为1，即不进行检查，分配请求总是成功
+    // 在可用内存过低时，fork仍会成功
+    // </MM>
     if (linuxOvercommitMemoryValue() == 0) {
         serverLog(LL_WARNING,"WARNING overcommit_memory is set to 0! Background save may fail under low memory condition. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.");
     }
+    // <MM>
+    // 检查是否开启大页
+    // 开启大页，在fork时，以copy-on-write方式共享内存，主进程在有写入时，会以页为单位
+    // 进行复制，大页，会导致复制的内存大幅增加，增加延迟
+    // 开启大页的好处是fork时间变短，因为复制的页表变小
+    // </MM>
     if (THPIsEnabled()) {
         serverLog(LL_WARNING,"WARNING you have Transparent Huge Pages (THP) support enabled in your kernel. This will create latency and memory usage issues with Redis. To fix this issue run the command 'echo never > /sys/kernel/mm/transparent_hugepage/enabled' as root, and add it to your /etc/rc.local in order to retain the setting after a reboot. Redis must be restarted after THP is disabled.");
     }
@@ -3518,6 +3592,9 @@ void daemonize(void) {
     if (fork() != 0) exit(0); /* parent exits */
     setsid(); /* create a new session */
 
+    // <MM>
+    // 将标准输入、输出重定向到/dev/null
+    // </MM>
     /* Every output goes to /dev/null. If Redis is daemonized but
      * the 'logfile' is set to 'stdout' in the configuration file
      * it will not log at all. */
@@ -3632,6 +3709,9 @@ void setupSignalHandlers(void) {
     sigaction(SIGINT, &act, NULL);
 
 #ifdef HAVE_BACKTRACE
+    // <MM>
+    // 在异常时，段错误等，打印错误堆栈
+    // </MM>
     sigemptyset(&act.sa_mask);
     act.sa_flags = SA_NODEFER | SA_RESETHAND | SA_SIGINFO;
     act.sa_sigaction = sigsegvHandler;
@@ -3824,13 +3904,36 @@ int main(int argc, char **argv) {
 #ifdef INIT_SETPROCTITLE_REPLACEMENT
     spt_init(argc, argv);
 #endif
+    // <MM>
+    // 设置字符排序规则，传入""以环境变量设置locale
+    // 主要影响正则表达式，字符串的排序
+    // </MM>
     setlocale(LC_COLLATE,"");
+    // <MM>
+    // 开启zmalloc的线程安全
+    // </MM>
     zmalloc_enable_thread_safeness();
+    // <MM>
+    // 设置out of memory时的回调函数
+    // 打印日志，退出进程
+    // </MM>
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
+    // <MM>
+    // 设置随机数种子，秒级别
+    // </MM>
     srand(time(NULL)^getpid());
+    // <MM>
+    // 设置字典的hash函数的种子，毫米级别
+    // </MM>
     gettimeofday(&tv,NULL);
     dictSetHashFunctionSeed(tv.tv_sec^tv.tv_usec^getpid());
+    // <MM>
+    // 根据命令行参数，判断是否为sentinel运行模式
+    // </MM>
     server.sentinel_mode = checkForSentinelMode(argc,argv);
+    // <MM>
+    // 使用默认值初始化配置
+    // </MM>
     initServerConfig();
 
     /* We need to init sentinel right now as parsing the configuration file
@@ -3847,6 +3950,9 @@ int main(int argc, char **argv) {
     if (strstr(argv[0],"redis-check-rdb") != NULL)
         exit(redis_check_rdb_main(argv,argc));
 
+    // <MM>
+    // 解析命令行参数
+    // </MM>
     if (argc >= 2) {
         int j = 1; /* First option to parse in argv[] */
         sds options = sdsempty();
@@ -3868,9 +3974,16 @@ int main(int argc, char **argv) {
             }
         }
 
+        // <MM>
+        // 解析配置文件参数
+        // </MM>
         /* First argument is the config file name? */
         if (argv[j][0] != '-' || argv[j][1] != '-')
             configfile = argv[j++];
+        // <MM>
+        // 将命令行参数以"option_name option_value\n"格式追加到字符串options
+        // 最后会添加到配置文件内容的最后，以覆盖配置文件中的内容
+        // </MM>
         /* All the other options are parsed and conceptually appended to the
          * configuration file. For instance --port 6380 will generate the
          * string "port 6380\n" to be parsed after the actual file name
@@ -3901,29 +4014,75 @@ int main(int argc, char **argv) {
             exit(1);
         }
         if (configfile) server.configfile = getAbsolutePath(configfile);
+        // <MM>
+        // 重置配置save频率的参数
+        // save 1 900
+        // </MM>
         resetServerSaveParams();
+        // <MM>
+        // 解析配置文件以及命令行传入的参数
+        // </MM>
         loadServerConfig(configfile,options);
+        // <MM>
+        // 释放用于临时存放命令行参数的内存空间
+        // </MM>
         sdsfree(options);
     } else {
         serverLog(LL_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : "redis");
     }
 
+    // <MM>
+    // To confirmed
+    // </MM>
     server.supervised = redisIsSupervised(server.supervised_mode);
     int background = server.daemonize && !server.supervised;
+    // <MM>
+    // 将进程转化成守护进程，即没有terminal和进程关联
+    // </MM>
     if (background) daemonize();
 
+    // <MM>
+    // 根据配置文件进行初始化
+    // </MM>
     initServer();
+    // <MM>
+    // 创建PID文件，将进程id写入该文件，并将路径赋值给server.pidfile
+    // </MM>
     if (background || server.pidfile) createPidFile();
+    // <MM>
+    // 设置进程title，用于ps，top时显示
+    // </MM>
     redisSetProcTitle(argv[0]);
     redisAsciiArt();
+    // <MM>
+    // 检查listen配置的backlog是否超过内核参数/proc/sys/net/core/somaxconn
+    //      /proc/sys/net/core/somaxconn是系统全局参数，用于限制每个socket
+    //      的监听队列的最大长度，即listen函数的backlog参数的最大值
+    // </MM>
     checkTcpBacklogSettings();
 
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_WARNING,"Server started, Redis version " REDIS_VERSION);
     #ifdef __linux__
+        // <MM>
+        // 检查内存配置
+        //  - 过量分配策略（/proc/sys/vm/overcommit_memory）
+        //      为避免进行rdb时分配内存失败，所以建议overcommit_memory的策略配置成1
+        //      即不检查内存过量分配，内存分配总是成功
+        //  - 是否开启huge page（/sys/kernel/mm/transparent_hugepage/enabled）
+        //      开启huge page时，内存页大小为2MB，使得相同内存空间的页表减少，在进行fork时拷贝的内存
+        //      减少，即fork耗时减少。
+        //      问题是，rdb或者aof rewrite时，父子进程以copy-on-write方式共享内存空间。父进程，即是
+        //      主进程会处理写请求，copy-on-write时会以页为单位进行拷贝。使用huge page会导致rdb、aof rewrite
+        //      时拷贝的内存量大大增加，导致请求处理延迟
+        //      所以建议关闭huge page
+        // </MM>
         linuxMemoryWarnings();
     #endif
+        // <MM>
+        // 加载aof或者rdb
+        // </MM>
         loadDataFromDisk();
         if (server.cluster_enabled) {
             if (verifyClusterConfigWithData() == C_ERR) {
@@ -3946,8 +4105,16 @@ int main(int argc, char **argv) {
         serverLog(LL_WARNING,"WARNING: You specified a maxmemory value that is less than 1MB (current value is %llu bytes). Are you sure this is what you really want?", server.maxmemory);
     }
 
+    // <MM>
+    // 注册beforeSleep函数，在每次事件循环前调用
+    // 处理replication和aof相关，以及超时踢出key
+    // </MM>
     aeSetBeforeSleepProc(server.el,beforeSleep);
+    // <MM>
+    // 开始事件循环，准备接收客户端请求
+    // </MM>
     aeMain(server.el);
+    // 退出事件循环，即退出redis，会删除事件循环结构
     aeDeleteEventLoop(server.el);
     return 0;
 }
