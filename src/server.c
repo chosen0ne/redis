@@ -735,16 +735,32 @@ void updateDictResizePolicy(void) {
  * The parameter 'now' is the current time in milliseconds as is passed
  * to the function to avoid too many gettimeofday() syscalls. */
 int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
+    // <MM>
+    // 获取key的过期时间
+    // </MM>
     long long t = dictGetSignedIntegerVal(de);
     if (now > t) {
         sds key = dictGetKey(de);
         robj *keyobj = createStringObject(key,sdslen(key));
 
+        // <MM>
+        // 将过期key的清除，传播到aof和主从同步backlog
+        // </MM>
         propagateExpire(db,keyobj,server.lazyfree_lazy_expire);
         if (server.lazyfree_lazy_expire)
+            // <MM>
+            // 配置异步清理过期key，有益于一些大的聚集对象的清除，造成的延迟加大
+            // 将要删除的key加入队列，由后台线程进行清理
+            // </MM>
             dbAsyncDelete(db,keyobj);
         else
+            // <MM>
+            // 同步清理过期可以
+            // </MM>
             dbSyncDelete(db,keyobj);
+        // <MM>
+        // 广播key expired事件
+        // </MM>
         notifyKeyspaceEvent(NOTIFY_EXPIRED,
             "expired",keyobj,db->id);
         decrRefCount(keyobj);
@@ -777,6 +793,16 @@ int activeExpireCycleTryExpire(redisDb *db, dictEntry *de, long long now) {
  * executed, where the time limit is a percentage of the REDIS_HZ period
  * as specified by the REDIS_EXPIRELOOKUPS_TIME_PERC define. */
 
+// <MM>
+// 清理过期key有两种模式：
+//  - fast：会限制执行的事件间隔，执行的时长，会以最小资源进行清理
+//  - slow：正常的清理过程，时长限制是一次事件循环的25%
+// 具体过程：
+//  activeExpireCycle函数会由于超过执行时限，分散在多次函数调用，所以
+//  使用了静态变量存储中间状态
+//  每轮会限定检查db的数量，对于每个db会进行多次检查，每次检查num个key（最多不超过20个）
+//  如果其中有超过25%的key过期，会继续插件该db。如果检查过程超过时限会退出整个过程
+// </MM>
 void activeExpireCycle(int type) {
     /* This function has some global state in order to continue the work
      * incrementally across calls. */
@@ -785,6 +811,9 @@ void activeExpireCycle(int type) {
     static long long last_fast_cycle = 0; /* When last fast cycle ran. */
 
     int j, iteration = 0;
+    // <MM>
+    // CRON_DBS_PER_CALL默认为16，即每一轮默认扫描16个db
+    // </MM>
     int dbs_per_call = CRON_DBS_PER_CALL;
     long long start = ustime(), timelimit;
 
@@ -792,7 +821,14 @@ void activeExpireCycle(int type) {
         /* Don't start a fast cycle if the previous cycle did not exited
          * for time limt. Also don't repeat a fast cycle for the same period
          * as the fast cycle total duration itself. */
+        // <MM>
+        // 如果上一次调用不是因为超时调用退出，说明过期的key不多，
+        // 在fast cycle的情况下，不需要继续处理
+        // </MM>
         if (!timelimit_exit) return;
+        // <MM>
+        // 在fast cycle模式下，清除过期key的执行频率不超过2s
+        // </MM>
         if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
         last_fast_cycle = start;
     }
@@ -804,6 +840,10 @@ void activeExpireCycle(int type) {
      * 2) If last time we hit the time limit, we want to scan all DBs
      * in this iteration, as there is work to do in some DB and we don't want
      * expired keys to use memory for too much time. */
+    // <MM>
+    // 如果上一次调用是因为超时限退出的，则说明有大量待清理的过期key
+    // 为避免这些key占用内存，这里尽量遍历处理所有db
+    // </MM>
     if (dbs_per_call > server.dbnum || timelimit_exit)
         dbs_per_call = server.dbnum;
 
@@ -816,6 +856,9 @@ void activeExpireCycle(int type) {
     if (timelimit <= 0) timelimit = 1;
 
     if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        // <MM>
+        // 在fast cycle模式下，timelimit设置为1ms
+        // </MM>
         timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
 
     for (j = 0; j < dbs_per_call; j++) {
@@ -845,6 +888,9 @@ void activeExpireCycle(int type) {
             /* When there are less than 1% filled slots getting random
              * keys is expensive, so stop here waiting for better times...
              * The dictionary will be resized asap. */
+            // <MM>
+            // 元素个数 / 桶个数 < 1%，说明整体需要过期的key总量就很少
+            // </MM>
             if (num && slots > DICT_HT_INITIAL_SIZE &&
                 (num*100/slots < 1)) break;
 
@@ -854,21 +900,36 @@ void activeExpireCycle(int type) {
             ttl_sum = 0;
             ttl_samples = 0;
 
+            // <MM>
+            // 限制每一轮随机查找次数，为20次
+            // </MM>
             if (num > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
                 num = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP;
 
+            // <MM>
+            // 从expired set中随机选择num个key进行判断、清理
+            // </MM>
             while (num--) {
                 dictEntry *de;
                 long long ttl;
 
                 if ((de = dictGetRandomKey(db->expires)) == NULL) break;
+                // <MM>
+                // 计算对应key的ttl，time to live，即存活时间
+                // </MM>
                 ttl = dictGetSignedIntegerVal(de)-now;
+                // <MM>
+                // 尝试清空该key
+                // </MM>
                 if (activeExpireCycleTryExpire(db,de,now)) expired++;
                 if (ttl < 0) ttl = 0;
                 ttl_sum += ttl;
                 ttl_samples++;
             }
 
+            // <MM>
+            // 计算该db的评价ttl
+            // </MM>
             /* Update the average TTL stats for this database. */
             if (ttl_samples) {
                 long long avg_ttl = ttl_sum/ttl_samples;
@@ -881,6 +942,9 @@ void activeExpireCycle(int type) {
             /* We can't block forever here even if there are many keys to
              * expire. So after a given amount of milliseconds return to the
              * caller waiting for the other active expire cycle. */
+            // <MM>
+            // 每迭代计算16次后，查看一下是否超过时间限制
+            // </MM>
             iteration++;
             if ((iteration & 0xf) == 0) { /* check once every 16 iterations. */
                 long long elapsed = ustime()-start;
@@ -891,6 +955,10 @@ void activeExpireCycle(int type) {
             if (timelimit_exit) return;
             /* We don't repeat the cycle if there are less than 25% of keys
              * found expired in the current DB. */
+            // <MM>
+            // 如果随机选择的key中超过25%过期，即认为该db过期的key有一定量，
+            // 还会继续尝试进行清理，知道过期key的比例小于25%，或者超过时限
+            // </MM>
         } while (expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4);
     }
 }
@@ -1301,11 +1369,23 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * later in this function. */
     if (server.cluster_enabled) clusterBeforeSleep();
 
+    // <MM>
+    // 清除过期的key
+    // 只在当前实例不是从的情况下进行，原因：
+    //  清理过期key时会有随机的选择key进行清除，如果主、从
+    //  同时随机选择清除的key，会导致不一致。
+    //  在主从同步时，主随机选择要清除的key，然后同步给从，避免上述问题
+    // </MM>
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
     if (server.active_expire_enabled && server.masterhost == NULL)
         activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
 
+    // <MM>
+    // 向所有slave请求已完成的同步进度
+    //  用于实现wait命令，支持同步复制，确保发送wait命令的client所有的命令在slave上都被replay，
+    //  如未被完成，会向所有slave请求ack的进度，并将当前client阻塞，直到返回
+    // </MM>
     /* Send all the slaves an ACK request if at least one client blocked
      * during the previous event loop iteration. */
     if (server.get_ack_from_slaves) {
@@ -1321,15 +1401,33 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         server.get_ack_from_slaves = 0;
     }
 
+    // <MM>
+    // 检查同步复制的client是否满足unblock的条件
+    // </MM>
     /* Unblock all the clients blocked for synchronous replication
      * in WAIT. */
     if (listLength(server.clients_waiting_acks))
         processClientsWaitingReplicas();
 
+    // <MM>
+    // 将进行完阻塞操作的client变成unblock的
+    // </MM>
     /* Try to process pending commands for clients that were just unblocked. */
     if (listLength(server.unblocked_clients))
         processUnblockedClients();
 
+    // <MM>
+    // 将缓存到内存的aof根据配置的策略落地到磁盘
+    //  需要在响应client之前将对应操作的aof写到磁盘，redis为了不影响性能，没有采用
+    //  执行每个命令之前就将对应的aof写入磁盘，而是批量写入，将io次数。
+    //  在一次事件循环中处理的多个写请求，会将对应的aof先写入buffer。待下一轮事件循环
+    //  将响应内容发送给client之前，将buffer写入磁盘。
+    //  由于beforeSleep函数会在事件循环之前执行，所以在此处调用函数flushAppendOnlyFile
+    //  将aof buffer落地磁盘
+    //
+    //  force参数传入的是0，即表示在sync策略为everysec时，如果有sync正在执行，就不进行
+    //  write操作，直接返回。不过，如果推迟写入的时间超过2s，就不会返回函数，继续进行write操作
+    // </MM>
     /* Write the AOF buffer on disk */
     flushAppendOnlyFile(0);
 
